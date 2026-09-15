@@ -1,165 +1,150 @@
+#include <assert.h>
+#include <stdalign.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
+#define DATA_CAPACITY 2
+#define ITEM_CAPACITY 1
 #define GROWTH_FACTOR 2
-#define INIT_CAPACITY 1
 
 /*
- * These conditions must always be true for the growth logic to work.
- */
-_Static_assert(INIT_CAPACITY > 0, "INIT_CAPACITY must be greater than zero");
-_Static_assert(GROWTH_FACTOR > 1, "GROWTH_FACTOR must be greater than one");
-
-/*
- * Memory layout:
+ * TODO
  *
- * +----------------------+-------------------------+
- * | struct array_header  | array elements          |
- * | capacity, count      | arr[0], arr[1], ...     |
- * +----------------------+-------------------------+
- * ^                      ^
- * header                 arr
+ * - Store item alignment in array_item_header.
+ *
+ * - Rework array growth.
+ *   Current realloc can move the backing allocation after data,
+ *   padding and destination_start have already been calculated.
+ *
+ * - Consider making growth explicit with array_grow().
+ *   array_append() can fail when there is not enough space.
+ *   array_grow() will invalidate previously returned pointers.
+ *
+ * - For data growth, experiment with malloc + repacking instead of
+ *   realloc:
+ *      allocate new arena
+ *      recalculate alignment/padding
+ *      copy each item
+ *      update offsets
+ *      free old arena
+ *
+ * - Grow item_header independently from the data arena.
+ *
+ * - Clean up array_get:
+ *      NULL checks
+ *      bounds checks
+ *
+ * - Rework array_remove using tombstones/free chunks.
+ *   Do not compact data for now so unrelated pointers stay valid.
+ *
+ * - Track freed chunks so later inserts can reuse space.
+ *
+ * - Add a second insertion strategy that searches free chunks for
+ *   suitable size/alignment.
+ *
+ * - Define pointer policy:
+ *      get() pointer remains valid until its item is removed,
+ *      the arena is grown/repacked, or the array is destroyed.
+ *
+ * - Add array_destroy() to free item_header and arr.
+ *
+ * - Add integer overflow checks for allocation/size calculations.
+ *
+ * - Improve error handling.
+ *
+ * - Later: convenience macros / _Generic for size and alignment.
  */
-struct array_header
+
+struct array_item_header
 {
-	size_t capacity;
-	size_t count;
+	size_t offset;
+	size_t size;
 };
 
-/*
- * Recover the hidden header stored immediately before the array data.
- *
- * Casting arr to struct array_header * and subtracting one moves backwards
- * by exactly sizeof(struct array_header).
- */
-static inline struct array_header *get_array_header(void *arr)
+struct array_header
 {
+	size_t length;
+	size_t data_used;
+	size_t data_capacity;
+	size_t item_capacity;
+	struct array_item_header *item_header;
+};
+
+struct array_header *array_init(void)
+{
+	struct array_header *arr = malloc(sizeof(*arr) + sizeof(unsigned char) * DATA_CAPACITY);
+
 	if (arr == NULL)
 	{
 		return NULL;
 	}
 
-	return ((struct array_header *)arr) - 1;
-}
+	struct array_item_header *arr_entries = malloc(sizeof(*arr_entries) * ITEM_CAPACITY);
 
-/*
- * Free the complete allocation, starting from the hidden header.
- *
- * This function cannot set the caller's pointer to NULL because arr is passed
- * by value. The caller should set its pointer to NULL after calling this.
- */
-void array_free(void *arr)
-{
-	if (arr == NULL)
+	if (arr_entries == NULL)
 	{
-		return;
+		free(arr);
+		return NULL;
 	}
 
-	free(get_array_header(arr));
+	arr->length = 0;
+	arr->data_used = 0;
+	arr->data_capacity = DATA_CAPACITY;
+	arr->item_capacity = ITEM_CAPACITY;
+	arr->item_header = arr_entries;
+
+	return arr;
 }
 
-/*
- * Return the number of elements currently stored in the array.
- *
- * A NULL array is treated as an empty array.
- */
-size_t array_len(void *arr)
-{
-	struct array_header *header = get_array_header(arr);
-
-	if (header == NULL)
-	{
-		return 0;
-	}
-
-	return header->count;
-}
-
-/*
- * Return the number of elements the current allocation can hold.
- *
- * A NULL array has zero capacity.
- */
-size_t array_capacity(void *arr)
-{
-	struct array_header *header = get_array_header(arr);
-
-	if (header == NULL)
-	{
-		return 0;
-	}
-
-	return header->capacity;
-}
-
-/*
- * Append an item to the array.
- *
- * Behaviour:
- * 1. If arr is NULL, allocate the initial array.
- * 2. If the array is full, increase its capacity.
- * 3. Store the item and increase the count.
- *
- * On allocation failure, the append is cancelled and the existing array
- * remains unchanged.
- */
-#define array_append(arr, item)                                                                    \
+#define array_append(arr, item, item_size, item_align)                                             \
 	do                                                                                             \
 	{                                                                                              \
 		if ((arr) == NULL)                                                                         \
 		{                                                                                          \
-			/* Prevent overflow in the initial allocation-size calculation. */                     \
-			if (INIT_CAPACITY > (SIZE_MAX - sizeof(struct array_header)) / sizeof(*(arr)))         \
+			(arr) = array_init();                                                                  \
+			if ((arr) == NULL)                                                                     \
 			{                                                                                      \
-				fputs("array_append: initial allocation size overflow\n", stderr);                 \
+				fputs("Error: malloc failed to initialize memory\n", stderr);                      \
 				break;                                                                             \
 			}                                                                                      \
-                                                                                                   \
-			size_t allocation_size = sizeof(struct array_header) + sizeof(*(arr)) * INIT_CAPACITY; \
-                                                                                                   \
-			struct array_header *new_header = malloc(allocation_size);                             \
-                                                                                                   \
-			if (new_header == NULL)                                                                \
-			{                                                                                      \
-				perror("array_append: malloc");                                                    \
-				break;                                                                             \
-			}                                                                                      \
-                                                                                                   \
-			new_header->capacity = INIT_CAPACITY;                                                  \
-			new_header->count = 0;                                                                 \
-                                                                                                   \
-			(arr) = (void *)(new_header + 1);                                                      \
 		}                                                                                          \
                                                                                                    \
-		struct array_header *header = get_array_header((arr));                                     \
+		struct array_header *header = (struct array_header *)(arr);                                \
+		struct array_item_header *item_header = header->item_header;                               \
                                                                                                    \
-		if (header->count >= header->capacity)                                                     \
+		if (item_header == NULL)                                                                   \
 		{                                                                                          \
-			/* Prevent overflow when multiplying the capacity. */                                  \
-			if (header->capacity > SIZE_MAX / GROWTH_FACTOR)                                       \
-			{                                                                                      \
-				fputs("array_append: capacity overflow\n", stderr);                                \
-				break;                                                                             \
-			}                                                                                      \
+			fputs("Error: Invalid array_header\n", stderr);                                        \
+			break;                                                                                 \
+		}                                                                                          \
                                                                                                    \
-			size_t new_capacity = header->capacity * GROWTH_FACTOR;                                \
+		unsigned char *data = (unsigned char *)(header + 1);                                       \
                                                                                                    \
-			/* Prevent overflow in: header size + element size * capacity. */                      \
-			if (new_capacity > (SIZE_MAX - sizeof(*header)) / sizeof(*(arr)))                      \
-			{                                                                                      \
-				fputs("array_append: allocation size overflow\n", stderr);                         \
-				break;                                                                             \
-			}                                                                                      \
+		const size_t append_item_size = (item_size);                                               \
+		const size_t append_item_align = (item_align);                                             \
                                                                                                    \
-			size_t new_allocation_size = sizeof(*header) + sizeof(*(arr)) * new_capacity;          \
+		if (append_item_align == 0)                                                                \
+		{                                                                                          \
+			fputs("array_append: item alignment must be greater than zero\n", stderr);             \
+			break;                                                                                 \
+		}                                                                                          \
                                                                                                    \
-			/*                                                                                     \
-			 * Use a temporary pointer.                                                            \
-			 *                                                                                     \
-			 * If realloc fails, it returns NULL but the original allocation remains               \
-			 * valid. Assigning directly to header would lose the original pointer.                \
-			 */                                                                                    \
+		uintptr_t current_address = (uintptr_t)(data + header->data_used);                         \
+                                                                                                   \
+		size_t alignment_remainder = current_address % append_item_align;                          \
+                                                                                                   \
+		size_t padding = alignment_remainder == 0 ? 0 : append_item_align - alignment_remainder;   \
+                                                                                                   \
+		size_t destination_start = header->data_used + padding;                                    \
+                                                                                                   \
+		if (destination_start + append_item_size > header->data_capacity)                          \
+		{                                                                                          \
+			size_t new_capacity = header->data_capacity * GROWTH_FACTOR;                           \
+                                                                                                   \
+			size_t new_allocation_size = sizeof(*header) + new_capacity;                           \
+                                                                                                   \
 			struct array_header *temporary_header = realloc(header, new_allocation_size);          \
                                                                                                    \
 			if (temporary_header == NULL)                                                          \
@@ -169,77 +154,114 @@ size_t array_capacity(void *arr)
 			}                                                                                      \
                                                                                                    \
 			header = temporary_header;                                                             \
-			header->capacity = new_capacity;                                                       \
-                                                                                                   \
-			/* realloc may move the allocation, so update the array pointer. */                    \
-			(arr) = (void *)(header + 1);                                                          \
+			header->data_capacity = new_capacity;                                                  \
+			(arr) = (void *)header;                                                                \
 		}                                                                                          \
                                                                                                    \
-		(arr)[header->count] = (item);                                                             \
-		++header->count;                                                                           \
+		if (header->length >= header->item_capacity)                                               \
+		{                                                                                          \
+			size_t new_capacity = header->item_capacity * GROWTH_FACTOR;                           \
+                                                                                                   \
+			size_t new_allocation_size = sizeof(*item_header) * new_capacity;                      \
+                                                                                                   \
+			struct array_item_header *temporary_item_header =                                      \
+			    realloc(item_header, new_allocation_size);                                         \
+                                                                                                   \
+			if (temporary_item_header == NULL)                                                     \
+			{                                                                                      \
+				perror("array_append: realloc");                                                   \
+				break;                                                                             \
+			}                                                                                      \
+                                                                                                   \
+			item_header = temporary_item_header;                                                   \
+			header->item_capacity = new_capacity;                                                  \
+			header->item_header = (void *)item_header;                                             \
+		}                                                                                          \
+                                                                                                   \
+		memcpy(data + destination_start, (item), append_item_size);                                \
+                                                                                                   \
+		size_t length = header->length;                                                            \
+                                                                                                   \
+		item_header[length].offset = destination_start;                                            \
+		item_header[length].size = append_item_size;                                               \
+                                                                                                   \
+		header->length += 1;                                                                       \
+		header->data_used = destination_start + append_item_size;                                  \
+                                                                                                   \
 	} while (0)
 
-/*
- * Remove an element at the supplied index.
- *
- * Elements after the removed item are shifted one position to the left.
- * Invalid indexes are ignored.
- *
- * A negative index becomes a large size_t value after conversion and will
- * fail the bounds check.
- */
+void *array_get(struct array_header *arr, size_t index)
+{
+	struct array_item_header *item_header = arr->item_header;
+
+	struct array_item_header *item = item_header + index;
+
+	unsigned char *data = (unsigned char *)(arr + 1);
+
+	return data + item->offset;
+}
+
 #define array_remove(arr, index)                                                                   \
 	do                                                                                             \
 	{                                                                                              \
-		struct array_header *header = get_array_header((arr));                                     \
-		size_t remove_index = (size_t)(index);                                                     \
-                                                                                                   \
-		if (header == NULL || remove_index >= header->count)                                       \
+		if ((arr) == NULL)                                                                         \
 		{                                                                                          \
+			fputs("Error: malloc failed to initialize memory\n", stderr);                          \
 			break;                                                                                 \
 		}                                                                                          \
                                                                                                    \
-		for (size_t i = remove_index; i + 1 < header->count; ++i)                                  \
+		struct array_header *header = (struct array_header *)(arr);                                \
+                                                                                                   \
+		if (index > header->length || index < 0)                                                   \
 		{                                                                                          \
-			(arr)[i] = (arr)[i + 1];                                                               \
+			perror("out of bound");                                                                \
+			break;                                                                                 \
 		}                                                                                          \
                                                                                                    \
-		--header->count;                                                                           \
+		struct array_item_header *item_header = header->item_header;                               \
+                                                                                                   \
+		if (item_header == NULL)                                                                   \
+		{                                                                                          \
+			fputs("Error: Invalid array_header\n", stderr);                                        \
+			break;                                                                                 \
+		}                                                                                          \
+                                                                                                   \
+		for (size_t i = index; i < header->length - 1; ++i)                                        \
+		{                                                                                          \
+			item_header[i] = item_header[i + 1];                                                   \
+		}                                                                                          \
+                                                                                                   \
+		header->length -= 1;                                                                       \
+                                                                                                   \
 	} while (0)
 
 int main(void)
 {
-	char *s = NULL;
+	void *arr = NULL;
 
-	array_append(s, 'a');
-	array_append(s, 'b');
-	array_append(s, 'c');
-	array_append(s, 'd');
+	char item[] = "skills";
+	size_t item_size = strlen(item) + 1;
 
-	/*
-	 * Avoid subtracting one from zero because array_len returns size_t,
-	 * which is unsigned.
-	 */
-	if (array_len(s) > 0)
-	{
-		array_remove(s, array_len(s) - 1);
-	}
+	int item1 = 676;
+	float item2 = 212.0;
 
-	for (size_t i = 0; i < array_len(s); ++i)
-	{
-		printf("%c\n", s[i]);
-	}
+	array_append(arr, item, item_size, alignof(char));
 
-	printf("Array Length = %zu\n", array_len(s));
-	printf("Array Capacity = %zu\n", array_capacity(s));
+	array_append(arr, &item1, sizeof(item1), alignof(int));
 
-	array_free(s);
+	array_append(arr, &item2, sizeof(item2), alignof(float));
 
-	/*
-	 * array_free cannot modify the caller's variable, so clear it manually
-	 * to prevent accidental use of a dangling pointer.
-	 */
-	s = NULL;
+	char *arr_item = (char *)array_get(arr, 0);
+
+	int *arr_item1 = (int *)array_get(arr, 1);
+
+	float *arr_item2 = (float *)array_get(arr, 2);
+
+	printf("%s\n", arr_item);
+	printf("%d\n", *arr_item1);
+	printf("%f\n", *arr_item2);
+
+	free(arr);
 
 	return 0;
 }
